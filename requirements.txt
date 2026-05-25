@@ -1,0 +1,7 @@
+opencv-python==4.13.0.74
+numpy==2.4.6
+streamlit==1.55.0
+scipy==1.17.1
+matplotlib==3.10.3
+Pillow==11.2.1
+pandas==2.2.3

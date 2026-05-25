@@ -1,0 +1,170 @@
+"""
+Streamlit web interface for bolt hole detection.
+Provides interactive parameter tuning and debug visualizations.
+"""
+
+import streamlit as st
+import cv2
+import numpy as np
+from pathlib import Path
+import tempfile
+from detector import BoltHoleDetector
+from utils import plot_projection_debug, draw_masks_overlay, create_side_by_side
+
+
+st.set_page_config(page_title="Bolt Hole Detector", layout="wide")
+st.title("🔩 B-Scan Bolt Hole Detector")
+st.markdown("Horizontal projection-based detection for scattered bolt hole patterns")
+
+# Sidebar for configuration
+with st.sidebar:
+    st.header("⚙️ Detection Parameters")
+    
+    sigma = st.slider(
+        'Smoothing sigma (σ)',
+        min_value=3, max_value=25, value=8, step=1,
+        help='Gaussian smoothing width (pixels). Higher = more tolerant of scatter. '
+             'Recommended: 5 (tight), 8 (medium), 12-15 (very scattered)'
+    )
+    
+    min_distance = st.slider(
+        'Min pixels between holes',
+        min_value=10, max_value=60, value=20, step=5,
+        help='Minimum x-distance between two separate bolt holes'
+    )
+    
+    prominence = st.slider(
+        'Peak prominence threshold',
+        min_value=0.1, max_value=2.0, value=0.3, step=0.1,
+        help='Peak must stand out this much from surroundings'
+    )
+    
+    show_debug = st.checkbox('Show debug visualizations', value=True)
+    show_masks = st.checkbox('Show colour masks overlay', value=False)
+    
+    st.markdown("---")
+    st.markdown("### About")
+    st.markdown("""
+    **Method:** Horizontal projection of colour density
+    
+    **How it works:**
+    1. Extract purple and grey pixel masks
+    2. Project vertically → 1D signals per colour
+    3. Smooth with Gaussian (σ=σ parameter)
+    4. Multiply purple × grey
+    5. Find peaks in combined signal
+    6. Each peak = one bolt hole
+    
+    **Why it's robust:**
+    - Works with scattered dot patterns
+    - Handles spread-out vertical distributions
+    - Only requires both colours at same x-position
+    """)
+
+
+# Main content area
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.header("📹 Input")
+    
+    # File uploader
+    uploaded_file = st.file_uploader("Upload ROI image (PNG/JPG/BMP)", type=['png', 'jpg', 'jpeg', 'bmp'])
+    
+    if uploaded_file is not None:
+        # Read image
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        roi_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        
+        st.success(f"✓ Loaded: {uploaded_file.name} ({roi_bgr.shape[1]}×{roi_bgr.shape[0]} px)")
+        
+        # Run detection
+        detector = BoltHoleDetector(sigma=sigma, min_distance=min_distance, prominence=prominence)
+        result = detector.detect(roi_bgr)
+        
+        # Display results
+        with col2:
+            st.header("📊 Results")
+            st.metric("Holes Detected", result['bolt_hole_count'])
+            
+            if result['bolt_hole_positions']:
+                st.subheader("Positions (x, y)")
+                for i, (x, y) in enumerate(result['bolt_hole_positions'], 1):
+                    st.text(f"{i}. ({x}, {y})")
+        
+        # Show annotated ROI
+        st.subheader("Detection Output")
+        roi_rgb = cv2.cvtColor(result['annotated_roi'], cv2.COLOR_BGR2RGB)
+        st.image(roi_rgb, use_column_width=True, caption='Detected holes (green circles)')
+        
+        # Debug visualizations
+        if show_debug:
+            st.subheader("🔬 Debug Visualizations")
+            
+            # Projection signals graph
+            debug_img = plot_projection_debug(result)
+            debug_rgb = cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB)
+            st.image(debug_rgb, use_column_width=True, 
+                    caption='Horizontal projection signals (peaks = holes)')
+            
+            st.markdown("""
+            **Reading the projection graph:**
+            - **Purple line** = Count of purple pixels at each x-position
+            - **Grey line** = Count of grey pixels at each x-position
+            - **Green line** = Purple × Grey (combined signal × 5 for visibility)
+            - **Red dotted lines** = Detected holes (peaks in combined signal)
+            
+            A hole is detected where the green line peaks, meaning both purple AND grey
+            densities are high at the same x-position.
+            """)
+        
+        if show_masks:
+            st.subheader("🎨 Colour Masks")
+            
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                # Purple mask
+                purple_display = np.zeros_like(roi_bgr)
+                purple_display[result['purple_mask']] = [180, 0, 180]  # Magenta
+                purple_rgb = cv2.cvtColor(purple_display, cv2.COLOR_BGR2RGB)
+                st.image(purple_rgb, caption='Purple mask')
+            
+            with col_b:
+                # Grey mask
+                grey_display = np.zeros_like(roi_bgr)
+                grey_display[result['grey_mask']] = [0, 180, 180]  # Cyan
+                grey_rgb = cv2.cvtColor(grey_display, cv2.COLOR_BGR2RGB)
+                st.image(grey_rgb, caption='Grey mask')
+            
+            # Overlay visualization
+            overlay = draw_masks_overlay(roi_bgr, result)
+            overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            st.image(overlay_rgb, use_column_width=True, caption='Masks overlaid on ROI')
+    
+    else:
+        st.info("👆 Upload an image to begin detection")
+        
+        # Example info
+        st.markdown("""
+        ### Expected Input Format:
+        - **ROI image** extracted from B-Scan video
+        - Between blue reference lines (top and bottom)
+        - Should contain purple and grey dot patterns
+        - Format: PNG, JPG, or BMP
+        
+        ### What the detector finds:
+        - Regions where purple AND grey pixels cluster at the same x-position
+        - Returns hole count and (x, y) coordinates
+        - Robust to scattered, vertical, or spread-out dot patterns
+        """)
+
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center'>
+    <p><strong>Bolt Hole Detector</strong> — Horizontal Projection Method</p>
+    <p><small>Uses colour clustering and projection-based peak detection</small></p>
+</div>
+""", unsafe_allow_html=True)

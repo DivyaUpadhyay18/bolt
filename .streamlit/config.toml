@@ -1,0 +1,14 @@
+[logger]
+level = "info"
+
+[server]
+# Maximum file upload size in MB (5GB = 5120 MB)
+maxUploadSize = 5120
+enableXsrfProtection = true
+
+[theme]
+# Color theme
+primaryColor = "#2E86DE"
+backgroundColor = "#F7F8F9"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#262730"
