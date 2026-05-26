@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import tempfile
 import os
+import time
 from detector import BoltHoleDetector
 from tracker import BoltHoleTracker
 from panel_finder import find_bscan_roi, draw_roi_overlay
@@ -34,10 +35,12 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚙️ Detection Parameters")
     
-    frame_skip = st.slider(
+    # Frame processing options
+    frame_skip = st.selectbox(
         "Process every N frames",
-        1, 10, 2,
-        help="Skip frames for speed"
+        options=[1, 2, 3, 4, 5, 10, 15, 20, 30],
+        index=1,  # Default to 2
+        help="Skip frames for speed — higher = faster but might miss some holes"
     )
     
     sigma = st.slider(
@@ -55,16 +58,49 @@ with st.sidebar:
     )
     
     prominence = st.slider(
-        "Peak prominence",
-        0.05, 2.0, 0.2,
+        "Peak prominence — lower catches weaker holes",
+        0.05, 1.0, 0.2,
         step=0.05,
         help="Detection sensitivity"
+    )
+    
+    st.markdown("---")
+    st.subheader("⚡ Speed Optimization")
+    
+    roi_cache_interval = st.select_slider(
+        "ROI re-detection frequency",
+        options=[1, 5, 10, 15, 20, 30, 50, 100],
+        value=30,
+        help="Re-detect ROI every N frames (higher = faster, lower = more accurate)"
+    )
+    
+    resolution_scale = st.selectbox(
+        "Process resolution scale",
+        options=["Full (100%)", "75%", "50%", "33%"],
+        index=0,
+        help="Process at lower resolution for speed boost (trades accuracy for speed)"
+    )
+    
+    resolution_scale_map = {
+        "Full (100%)": 1.0,
+        "75%": 0.75,
+        "50%": 0.5,
+        "33%": 0.33
+    }
+    scale_factor = resolution_scale_map[resolution_scale]
+    
+    display_update_freq = st.select_slider(
+        "Display refresh rate",
+        options=[1, 5, 10, 15, 30],
+        value=1,
+        help="Update screen every N processed frames (higher = faster rendering)"
     )
     
     st.markdown("---")
     st.subheader("📊 Display Options")
     show_debug = st.checkbox("Show projection debug graph", value=False)
     show_roi = st.checkbox("Show detection zone outline", value=True)
+    headless_mode = st.checkbox("Headless mode (no display, faster processing)", value=False)
 
 # ============================================================================
 # MAIN PROCESSING
@@ -105,19 +141,28 @@ if uploaded_file is not None:
                 )
                 tracker = BoltHoleTracker(max_distance=35, max_missing_frames=6)
                 
+                cached_roi_dict = None  # Cache ROI boundaries
+                
                 stored_frames = {}  # {frame_num: annotated_bgr_frame}
                 frame_results = []
                 
                 # Placeholders
-                frame_col, count_col = st.columns([3, 1])
-                frame_display = frame_col.empty()
-                count_display = count_col.empty()
+                if not headless_mode:
+                    frame_col, count_col = st.columns([3, 1])
+                    frame_display = frame_col.empty()
+                    count_display = count_col.empty()
                 progress_bar = st.progress(0)
-                chart_ph = st.empty()
-                debug_ph = st.empty()
+                if not headless_mode:
+                    chart_ph = st.empty()
+                    debug_ph = st.empty()
+                
+                # Performance timing
+                frame_times = []
+                start_time = time.time()
                 
                 # Process frames
                 frame_num = 0
+                processed_count = 0
                 while cap.isOpened():
                     ret, frame = cap.read()
                     if not ret:
@@ -127,46 +172,100 @@ if uploaded_file is not None:
                     if frame_num % frame_skip != 0:
                         continue
                     
-                    # 1. Find ROI
-                    roi_dict = find_bscan_roi(frame)
+                    frame_start = time.time()
+                    processed_count += 1
+                    
+                    # Scale frame for faster processing
+                    if scale_factor < 1.0:
+                        frame_scaled = cv2.resize(
+                            frame,
+                            (int(frame.shape[1] * scale_factor),
+                             int(frame.shape[0] * scale_factor)),
+                            interpolation=cv2.INTER_LINEAR
+                        )
+                    else:
+                        frame_scaled = frame
+                    
+                    # ================================================================
+                    # 1. FIND ROI — with caching at new interval
+                    # ================================================================
+                    if (cached_roi_dict is None or
+                            not cached_roi_dict["found"] or
+                            processed_count % roi_cache_interval == 0):
+                        cached_roi_dict = find_bscan_roi(frame_scaled)
+                    
+                    # Skip frame if ROI detection failed
+                    if not cached_roi_dict["found"]:
+                        print(f"[FRAME {frame_num}] ROI not found, skipping")
+                        continue
+                    
+                    # Re-crop ROI from current frame using cached boundaries
+                    roi_dict = cached_roi_dict.copy()
+                    roi_dict["roi"] = frame_scaled[
+                        cached_roi_dict["y_top"]:cached_roi_dict["y_bot"],
+                        cached_roi_dict["x_left"]:cached_roi_dict["x_right"]
+                    ]
                     roi = roi_dict["roi"]
                     
-                    # 2. Detect holes
-                    result = detector.detect(roi)
+                    # ================================================================
+                    # 2. DETECT HOLES
+                    # ================================================================
+                    result = detector.detect(roi, sigma=sigma, min_distance=min_dist, 
+                                             prominence=prominence)
                     
-                    # 3. Track holes
+                    # ================================================================
+                    # 3. TRACK HOLES
+                    # ================================================================
                     active = tracker.update(result["bolt_hole_positions"], frame_num)
                     
-                    # 4. Draw numbered labels on ROI
-                    ann_roi = draw_numbered_holes(result["annotated_roi"], active)
+                    # ================================================================
+                    # 4. DRAW NUMBERED LABELS (skip in headless mode)
+                    # ================================================================
+                    if not headless_mode:
+                        ann_roi = draw_numbered_holes(result["annotated_roi"], active)
+                    else:
+                        ann_roi = result["annotated_roi"]
                     
-                    # 5. Paste ROI back into full frame
-                    ann_frame = frame.copy()
-                    ann_frame[roi_dict["y_top"]:roi_dict["y_bot"],
-                              roi_dict["x_left"]:roi_dict["x_right"]] = ann_roi
+                    # ================================================================
+                    # 5. PASTE ROI BACK INTO FULL FRAME (skip in headless mode)
+                    # ================================================================
+                    if not headless_mode:
+                        ann_frame = frame_scaled.copy()
+                        ann_frame[roi_dict["y_top"]:roi_dict["y_bot"],
+                                  roi_dict["x_left"]:roi_dict["x_right"]] = ann_roi
+                        
+                        # ================================================================
+                        # 6. DRAW ROI OUTLINE
+                        # ================================================================
+                        if show_roi:
+                            ann_frame = draw_roi_overlay(ann_frame, roi_dict)
+                        
+                        # ================================================================
+                        # 7. DRAW SUMMARY BANNER
+                        # ================================================================
+                        total_unique = tracker.next_id - 1
+                        banner = f"ACTIVE: {len(active)}  |  TOTAL UNIQUE: {total_unique}"
+                        
+                        # Black outline
+                        cv2.putText(ann_frame, banner, (30, 35),
+                                    cv2.FONT_HERSHEY_DUPLEX, 0.9,
+                                    (0, 0, 0), 4, cv2.LINE_AA)
+                        # White text
+                        cv2.putText(ann_frame, banner, (30, 35),
+                                    cv2.FONT_HERSHEY_DUPLEX, 0.9,
+                                    (255, 255, 255), 2, cv2.LINE_AA)
+                    else:
+                        total_unique = tracker.next_id - 1
                     
-                    # 6. Draw ROI outline if requested
-                    if show_roi:
-                        ann_frame = draw_roi_overlay(ann_frame, roi_dict)
-                    
-                    # 7. Draw summary banner
-                    total_unique = tracker.next_id - 1
-                    banner = f"ACTIVE: {len(active)}  |  TOTAL UNIQUE: {total_unique}"
-                    
-                    # Black outline
-                    cv2.putText(ann_frame, banner, (30, 35),
-                                cv2.FONT_HERSHEY_DUPLEX, 0.9,
-                                (0, 0, 0), 4, cv2.LINE_AA)
-                    # White text
-                    cv2.putText(ann_frame, banner, (30, 35),
-                                cv2.FONT_HERSHEY_DUPLEX, 0.9,
-                                (255, 255, 255), 2, cv2.LINE_AA)
-                    
-                    # 8. Store frame (every 5th)
-                    if len(frame_results) % 5 == 0:
+                    # ================================================================
+                    # 8. STORE FRAME FOR NAVIGATOR
+                    # ================================================================
+                    if len(frame_results) % 5 == 0 and not headless_mode:
                         stored_frames[frame_num] = ann_frame.copy()
                     
-                    # 9. Collect results
+                    # ================================================================
+                    # 9. COLLECT RESULTS
+                    # ================================================================
                     ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                     frame_results.append({
                         "frame": frame_num,
@@ -175,52 +274,76 @@ if uploaded_file is not None:
                         "total_unique": total_unique,
                     })
                     
-                    # 10. Update displays
-                    frame_display.image(
-                        cv2.cvtColor(ann_frame, cv2.COLOR_BGR2RGB),
-                        use_column_width=True,
-                        caption=f"Frame {frame_num}"
-                    )
+                    frame_time = time.time() - frame_start
+                    frame_times.append(frame_time)
                     
-                    count_display.markdown(
-                        f"<div style='text-align: center;'>"
-                        f"<h2>🟢 {len(active)}</h2>"
-                        f"<p>Active holes</p>"
-                        f"<hr>"
-                        f"<p><b>Total unique:</b> {total_unique}</p>"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
+                    # ================================================================
+                    # 10. UPDATE DISPLAYS (only if display_update_freq reached)
+                    # ================================================================
+                    if not headless_mode and len(frame_results) % display_update_freq == 0:
+                        frame_display.image(
+                            cv2.cvtColor(ann_frame, cv2.COLOR_BGR2RGB),
+                            use_column_width=True,
+                            caption=f"Frame {frame_num}"
+                        )
+                        
+                        count_display.markdown(
+                            f"<div style='text-align: center;'>"
+                            f"<h2>🟢 {len(active)}</h2>"
+                            f"<p>Active holes</p>"
+                            f"<hr>"
+                            f"<p><b>Total unique:</b> {total_unique}</p>"
+                            f"<hr>"
+                            f"<p style='font-size: 0.8em;'>Frame time: {frame_time*1000:.1f}ms</p>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+                        
+                        # ================================================================
+                        # 11. UPDATE CHART (every 15 frames)
+                        # ================================================================
+                        if len(frame_results) % 15 == 0:
+                            df_chart = pd.DataFrame(frame_results)
+                            chart_ph.line_chart(df_chart.set_index("frame")["active_holes"])
+                        
+                        # ================================================================
+                        # 12. SHOW DEBUG GRAPH (if enabled)
+                        # ================================================================
+                        if show_debug and "combined_signal" in result:
+                            debug_result = {
+                                "purple_proj": result["purple_proj"],
+                                "red_proj": result["red_proj"],
+                                "grey_proj": result["grey_proj"],
+                                "combined_signal": result["combined_signal"],
+                                "bolt_hole_positions": result["bolt_hole_positions"],
+                            }
+                            debug_img = plot_projection_debug(debug_result)
+                            debug_ph.image(
+                                cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB),
+                                caption="Projection signals (red dashed = detected holes)"
+                            )
                     
                     progress_bar.progress(min(frame_num / total_frames, 1.0))
-                    
-                    # Update chart every 15 frames
-                    if len(frame_results) % 15 == 0:
-                        df_chart = pd.DataFrame(frame_results)
-                        chart_ph.line_chart(df_chart.set_index("frame")["active_holes"])
-                    
-                    # Show debug graph if enabled
-                    if show_debug and "combined_signal" in result:
-                        debug_result = {
-                            "purple_proj": result["purple_proj"],
-                            "red_proj": result["red_proj"],
-                            "grey_proj": result["grey_proj"],
-                            "combined_signal": result["combined_signal"],
-                            "bolt_hole_positions": result["bolt_hole_positions"],
-                        }
-                        debug_img = plot_projection_debug(debug_result)
-                        debug_ph.image(
-                            cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB),
-                            caption="Projection signals (red dashed = detected holes)"
-                        )
                 
                 cap.release()
                 
                 # ================================================================
+                # PERFORMANCE METRICS
+                # ================================================================
+                elapsed_time = time.time() - start_time
+                avg_frame_time = np.mean(frame_times) if frame_times else 0
+                fps_achieved = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+                
+                if headless_mode:
+                    st.success(f"✅ Headless processing complete!")
+                    st.info(f"⏱️ **Performance**: {processed_count} frames in {elapsed_time:.1f}s "
+                           f"({fps_achieved:.1f} FPS avg, {avg_frame_time*1000:.1f}ms/frame)")
+                else:
+                    st.success(f"✅ Processing complete — {len(frame_results)} frames analysed")
+                
+                # ================================================================
                 # RESULTS SUMMARY
                 # ================================================================
-                
-                st.success(f"✅ Processing complete — {len(frame_results)} frames analysed")
                 
                 st.subheader("📈 Results")
                 if frame_results:
@@ -232,6 +355,14 @@ if uploaded_file is not None:
                     col2.metric("Max Active", int(df["active_holes"].max()))
                     col3.metric("Total Unique", int(df["total_unique"].iloc[-1]))
                     col4.metric("Avg Active", f"{df['active_holes'].mean():.1f}")
+                    
+                    st.markdown("---")
+                    st.subheader("⚡ Performance Metrics")
+                    perf_col1, perf_col2, perf_col3, perf_col4 = st.columns(4)
+                    perf_col1.metric("Total Time", f"{elapsed_time:.1f}s")
+                    perf_col2.metric("Avg Frame Time", f"{avg_frame_time*1000:.1f}ms")
+                    perf_col3.metric("Achieved FPS", f"{fps_achieved:.1f}")
+                    perf_col4.metric("Skip Ratio", f"1:{frame_skip}")
                     
                     st.download_button(
                         "📥 Download Results CSV",
@@ -250,7 +381,9 @@ if uploaded_file is not None:
                 st.markdown("---")
                 st.header("🔍 Individual Hole Navigator")
                 
-                if tracker.hole_history:
+                if headless_mode:
+                    st.info("ℹ️ Hole navigator not available in headless mode")
+                elif tracker.hole_history:
                     
                     # Summary table
                     history_data = []
@@ -316,8 +449,14 @@ if uploaded_file is not None:
                     st.info("No holes detected in this video.")
     
     finally:
+        # Clean up temp file with error handling
         if os.path.exists(temp_video_path):
-            os.unlink(temp_video_path)
+            try:
+                cap.release()  # Ensure video is released
+                time.sleep(0.5)  # Small delay to release file lock
+                os.unlink(temp_video_path)
+            except Exception as e:
+                print(f"[WARNING] Could not delete temp file: {e}")
 
 else:
     st.info("👆 Upload a B-Scan video to get started")

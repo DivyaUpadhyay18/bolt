@@ -1,119 +1,148 @@
 """
-Find the B-Scan detection zone in video frames.
-Visual detection based on blue/red lines and grey panel background.
-Works with any zoom level or frame position.
+Find the B-Scan detection zone using "B Scan" text as anchor.
+Uses OCR to locate text, then restricts line detection to that region.
 """
 
 import cv2
 import numpy as np
 
+try:
+    import pytesseract
+    from pytesseract import Output
+    PYTESSERACT_AVAILABLE = True
+except ImportError:
+    PYTESSERACT_AVAILABLE = False
+    print("[WARNING] pytesseract not available - OCR detection disabled")
+
 
 def find_bscan_roi(frame):
     """
-    Extract ONLY the B-Scan scanning region from frame.
+    Find B-Scan ROI using "B Scan" text for y_top and red line for y_bot.
     
-    The B-Scan is the DATA SWEEP AREA bounded by:
-    - Top: SECOND blue horizontal line
-    - Bottom: RED horizontal line
-    - Left: Start of the grey scanning grid
-    - Right: End of the grey scanning grid (NOT extending to data table)
-    
-    Works at ANY zoom level by detecting visual boundaries only.
+    Strategy:
+    1. Use OCR/pixel search to find "B Scan" text → y_top of panel
+    2. Search for red line below text → y_bot of panel
+    3. Use blue lines ONLY to measure x_left and x_right
+    4. Extract full B-Scan region from top of panel to red line
     
     Returns:
-        dict with keys: roi, y_top, y_bot, x_left, x_right, found (bool)
+        dict with roi, y_top, y_bot, x_left, x_right, found (bool)
     """
-    height, width = frame.shape[:2]
+    H, W = frame.shape[:2]
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
-    print("[ROI] ========== SEARCHING FOR B-SCAN REGION ==========")
+    print("[ROI] ========== FINDING B-SCAN REGION ==========")
     
     # ========================================================================
-    # STEP 1 — Find horizontal BLUE lines (top boundary)
-    # Look for SOLID horizontal blue lines, not scattered pixels
+    # STEP 1 — Find "B Scan" text to determine y_top
     # ========================================================================
-    print("[ROI] Step 1: Detecting BLUE horizontal lines...")
-    blue_lines = _find_horizontal_lines(frame_rgb, color_type='blue', min_strength=40)
+    y_text_bottom = find_bscan_text_y(frame_rgb)
     
-    if len(blue_lines) < 2:
-        print(f"[ROI] ERROR: Found only {len(blue_lines)} blue lines, need 2")
-        return _get_adaptive_fallback_roi(frame)
+    if y_text_bottom is None:
+        print("[ROI] FAIL: Could not find 'B Scan' text in frame")
+        return _return_empty_roi()
     
-    blue_lines = sorted(blue_lines)
-    y_second_blue = blue_lines[1]
-    print(f"[ROI] ✓ Blue lines found: {blue_lines}")
-    print(f"[ROI] ✓ Using SECOND blue line at y={y_second_blue}")
-    
-    # ========================================================================
-    # STEP 2 — Find horizontal RED line (bottom boundary)
-    # ========================================================================
-    print("[ROI] Step 2: Detecting RED horizontal line...")
-    red_lines = _find_horizontal_lines(frame_rgb, color_type='red', min_strength=40)
-    
-    if len(red_lines) == 0:
-        print("[ROI] ERROR: No red line found")
-        return _get_adaptive_fallback_roi(frame)
-    
-    red_lines = sorted(red_lines)
-    
-    # Find first red line BELOW second blue line
-    y_red = None
-    for ry in red_lines:
-        if ry > y_second_blue + 10:
-            y_red = ry
+    y_top = y_text_bottom + 2
+
+    # Find how far down the first blue line is from y_top
+    # and skip past it completely
+    frame_rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    H, W       = frame.shape[:2]
+    x_end      = int(W * 0.55)
+
+    # Scan downward from y_top to find the first blue line
+    y_first_blue_from_top = None
+    for dy in range(0, 40):
+        scan_y = y_top + dy
+        if scan_y >= H:
             break
+        row    = frame_rgb[scan_y, 0:x_end]
+        R_row  = row[:, 0].astype(int)
+        G_row  = row[:, 1].astype(int)
+        B_row  = row[:, 2].astype(int)
+        blue_count = int(((R_row < 100) & (G_row < 100) & (B_row > 130)).sum())
+        if blue_count >= max(int(x_end * 0.06), 15):
+            y_first_blue_from_top = scan_y
+            print(f"[ROI] first blue line found at y={scan_y} "
+                  f"blue_count={blue_count}")
+            break
+
+    if y_first_blue_from_top is not None:
+        # Find where the blue line ends (bottom of blue line group)
+        y_after_blue = y_first_blue_from_top
+        for dy in range(0, 15):
+            scan_y = y_first_blue_from_top + dy
+            if scan_y >= H:
+                break
+            row    = frame_rgb[scan_y, 0:x_end]
+            R_row  = row[:, 0].astype(int)
+            G_row  = row[:, 1].astype(int)
+            B_row  = row[:, 2].astype(int)
+            blue_count = int(
+                ((R_row < 100) & (G_row < 100) & (B_row > 130)).sum()
+            )
+            if blue_count >= max(int(x_end * 0.06), 15):
+                y_after_blue = scan_y
+            else:
+                break
+
+        # Set y_top to just below the entire first blue line
+        y_top = y_after_blue + 3
+        print(f"[ROI] y_top adjusted to skip first blue line: "
+              f"y_top={y_top}")
+
+    print(f"[ROI] y_top (just below 'B Scan' text and blue line) = {y_top}")
+    
+    # ========================================================================
+    # STEP 2 — Find red line to determine y_bot
+    # ========================================================================
+    y_red = find_red_line_y(frame_rgb, y_top)
     
     if y_red is None:
-        print(f"[ROI] ERROR: Red line not below blue line. Red: {red_lines}, Blue-2: {y_second_blue}")
-        return _get_adaptive_fallback_roi(frame)
+        print("[ROI] FAIL: Could not find red line below B Scan text")
+        return _return_empty_roi()
     
-    print(f"[ROI] ✓ Red line found at y={y_red}")
+    y_bot = y_red - 2
+    print(f"[ROI] y_bot (just above red line) = {y_bot}")
     
-    # ========================================================================
-    # STEP 3 — Set Y boundaries with minimal margins
-    # ========================================================================
-    y_top = y_second_blue + 1
-    y_bot = y_red - 1
+    if (y_bot - y_top) < 10:
+        print(f"[ROI] ERROR: detection zone too thin {y_bot - y_top}px")
+        return _return_empty_roi()
     
-    print(f"[ROI] ✓ Y boundaries: [{y_top}, {y_bot}] (height={y_bot-y_top})")
-    
-    if (y_bot - y_top) < 5:
-        print(f"[ROI] ERROR: Detection zone too small")
-        return _get_adaptive_fallback_roi(frame)
+    print(f"[ROI] ✓ Detection zone: y_top={y_top} to y_bot={y_bot} "
+          f"(height={y_bot - y_top}px)")
     
     # ========================================================================
-    # STEP 4 — Find X boundaries by detecting the GREY PANEL
-    # The B-Scan panel has consistent grey/dark background
-    # Extend only as far as grey extends, not into white table
+    # STEP 3 — Find blue lines for x measurement
     # ========================================================================
-    print("[ROI] Step 3: Detecting HORIZONTAL boundaries of grey B-Scan panel...")
-    x_left, x_right = _find_grey_panel_boundaries(frame_rgb, y_top, y_bot)
+    blue_lines = find_blue_lines_between(frame_rgb, y_top, y_bot)
+    print(f"[ROI] Blue lines found at y={blue_lines}")
     
-    print(f"[ROI] ✓ X boundaries: [{x_left}, {x_right}] (width={x_right-x_left})")
-    
-    if (x_right - x_left) < 20:
-        print(f"[ROI] ERROR: Detection zone too narrow")
-        return _get_adaptive_fallback_roi(frame)
+    if len(blue_lines) == 0:
+        # Fallback: use middle of zone for x measurement
+        y_for_x = (y_top + y_bot) // 2
+        print(f"[ROI] No blue lines found, using zone midpoint y={y_for_x}")
+    else:
+        y_for_x = blue_lines[0]  # Use first blue line
     
     # ========================================================================
-    # STEP 5 — FINAL CHECK: Verify we have actual B-Scan content
+    # STEP 4 — Find x_left and x_right from blue line extent
+    # ========================================================================
+    x_left, x_right = find_panel_x_extent(frame, y_for_x, y_for_x, y_red)
+    
+    if (x_right - x_left) < int(W * 0.10):
+        print(f"[ROI] WARNING: panel width too narrow "
+              f"({x_right - x_left}px), check line detection")
+    
+    # ========================================================================
+    # STEP 5 — Crop ROI
     # ========================================================================
     roi = frame[y_top:y_bot, x_left:x_right]
-    roi_rgb = frame_rgb[y_top:y_bot, x_left:x_right]
     
-    # Check if ROI has any non-white content (should have B-Scan data)
-    is_white = (roi_rgb[:,:,0] > 240) & (roi_rgb[:,:,1] > 240) & (roi_rgb[:,:,2] > 240)
-    white_percentage = np.sum(is_white) / (roi_rgb.shape[0] * roi_rgb.shape[1])
-    
-    if white_percentage > 0.8:
-        print(f"[ROI] ERROR: ROI is {white_percentage*100:.1f}% white - not a B-Scan region")
-        return _get_adaptive_fallback_roi(frame)
-    
-    print(f"[ROI] ✓ ROI content check: {100-white_percentage*100:.1f}% is non-white")
-    
-    print(f"[ROI] ========== B-SCAN REGION DETECTED ==========")
-    print(f"[ROI] auto=YES y_top={y_top} y_bot={y_bot} x_left={x_left} x_right={x_right} "
-          f"shape={roi.shape}")
+    print(f"[ROI] ========== SUCCESS ==========")
+    print(f"[ROI] FINAL: y_top={y_top} y_bot={y_bot} "
+          f"x_left={x_left} x_right={x_right} "
+          f"roi_shape={roi.shape}")
     
     return {
         "roi": roi,
@@ -125,335 +154,373 @@ def find_bscan_roi(frame):
     }
 
 
-def _find_horizontal_lines(frame_rgb, color_type='blue', min_strength=40):
+def find_bscan_text_y(frame_rgb):
     """
-    Find SOLID horizontal lines of specific color.
-    
-    Looks for rows where the entire row (or majority) has strong color dominance.
-    This finds ACTUAL lines, not scattered pixels.
-    
-    Args:
-        frame_rgb: RGB frame
-        color_type: 'blue' or 'red'
-        min_strength: minimum color dominance to count as a line
-    
-    Returns:
-        list of y-coordinates of detected lines
+    Find the y-coordinate of the bottom of the "B Scan" text label.
+    The B-Scan panel starts immediately below this y.
+
+    Strategy:
+    The "B Scan" text label always appears on a row that has
+    ALL of these properties simultaneously:
+      1. Very few dark pixels (just 2-3 words of text) — 
+         between 3 and 60 dark pixels in the left 50% of frame
+      2. Background is LIGHT GREY (not the dark dotted A-Scan background)
+      3. Immediately below this row (within 25px) is a BLUE horizontal line
+         OR a dark panel border line spanning at least 50px
+
+    The A-Scan area above has:
+      - Grid dot rows with many evenly spaced dark pixels > 60
+      - Dark background regions
+      - No blue line immediately below text rows
+
+    This combination of conditions uniquely identifies the "B Scan" label row.
     """
     H, W = frame_rgb.shape[:2]
+
+    # Search only in bottom 70% of frame height
+    # "B Scan" label is never in the top 30%
+    y_search_start = int(H * 0.30)
+    y_search_end   = int(H * 0.85)
+    x_search_end   = int(W * 0.50)
+
+    # ── Method A: pytesseract OCR ──────────────────────────────
+    try:
+        if PYTESSERACT_AVAILABLE:
+            search_region = frame_rgb[y_search_start:y_search_end,
+                                  0:x_search_end]
+
+            data = pytesseract.image_to_data(
+                search_region,
+                output_type=Output.DICT,
+                config="--psm 11 --oem 3"
+            )
+
+            matches = []
+            for i, text in enumerate(data["text"]):
+                cleaned = text.strip().lower().replace(" ", "")
+                if cleaned in ["bscan", "b-scan", "bsca", "scan"] and len(cleaned) >= 4:
+                    conf = int(data["conf"][i])
+                    if conf < 10:
+                        continue
+                    y_bottom = y_search_start + data["top"][i] + data["height"][i]
+                    matches.append((conf, y_bottom))
+                    print(f"[ANCHOR] OCR: '{text}' conf={conf} "
+                          f"y_bottom={y_bottom}")
+
+            if matches:
+                # Take the highest confidence match
+                matches.sort(reverse=True)
+                y_text_bottom = matches[0][1]
+                print(f"[ANCHOR] OCR selected y_text_bottom={y_text_bottom}")
+                return y_text_bottom
+
+            print("[ANCHOR] OCR did not find 'B Scan' text")
+
+    except Exception as e:
+        print(f"[ANCHOR] OCR failed: {e}")
+
+    # ── Method B: Find "B Scan" row by three-condition check ──
+    # Condition 1: Row has few dark pixels (text only, not grid)
+    # Condition 2: Row background is light grey
+    # Condition 3: A blue or dark border line exists below within 25px
+
+    R_full = frame_rgb[y_search_start:y_search_end,
+                       0:x_search_end, 0].astype(int)
+    G_full = frame_rgb[y_search_start:y_search_end,
+                       0:x_search_end, 1].astype(int)
+    B_full = frame_rgb[y_search_start:y_search_end,
+                       0:x_search_end, 2].astype(int)
+
+    # Dark pixel mask (text pixels)
+    dark_mask    = (R_full < 120) & (G_full < 120) & (B_full < 120)
+    dark_per_row = dark_mask.sum(axis=1)
+
+    # Light grey background mask
+    # Light grey: all channels 170-245, low saturation
+    grey_mask    = ((R_full > 170) & (R_full < 245) &
+                    (np.abs(R_full - G_full) < 20) &
+                    (np.abs(G_full - B_full) < 20))
+    grey_per_row = grey_mask.sum(axis=1)
+
+    # Blue pixel mask for border detection
+    blue_mask    = (R_full < 100) & (G_full < 100) & (B_full > 130)
+    blue_per_row = blue_mask.sum(axis=1)
+
+    n_rows    = R_full.shape[0]
+    min_blue  = max(int(x_search_end * 0.06), 15)
+    min_grey  = max(int(x_search_end * 0.40), 50)
+
+    print(f"[ANCHOR] Scanning rows {y_search_start} to "
+          f"{y_search_end} for B Scan label...")
+
+    for rel_y in range(n_rows - 25):
+        abs_y = y_search_start + rel_y
+
+        # Condition 1: Few dark pixels — text row only
+        # Must have between 3 and 80 dark pixels
+        # A-Scan grid rows have many more dark pixels
+        if not (3 <= dark_per_row[rel_y] <= 80):
+            continue
+
+        # Condition 2: Mostly light grey background
+        # At least 40% of the row must be grey
+        if grey_per_row[rel_y] < min_grey:
+            continue
+
+        # Condition 3: Blue border line within 5 to 25 rows below
+        blue_below = False
+        for dy in range(5, 26):
+            if rel_y + dy >= n_rows:
+                break
+            if blue_per_row[rel_y + dy] >= min_blue:
+                blue_below = True
+                print(f"[ANCHOR] Method B: text-like row at "
+                      f"abs_y={abs_y} dark={dark_per_row[rel_y]} "
+                      f"grey={grey_per_row[rel_y]} "
+                      f"blue_border at +{dy}px")
+                break
+
+        if blue_below:
+            # This row matches all three conditions
+            # Return the y just below this text row
+            y_text_bottom = abs_y + 3
+            print(f"[ANCHOR] Method B found B Scan text at "
+                  f"y_text_bottom={y_text_bottom}")
+            return y_text_bottom
+
+    # ── Method C: Last resort — find the text row with blue line ─
+    # The line immediately above the B-Scan panel border also has
+    # few dark pixels and light background. The B-Scan panel border
+    # appears within 10px below it.
+
+    print("[ANCHOR] Method B failed — trying Method C (fallback)")
+
+    for rel_y in range(n_rows - 10):
+        abs_y = y_search_start + rel_y
+
+        # Look for a row with few dark pixels AND grey background
+        if not (2 <= dark_per_row[rel_y] <= 100):
+            continue
+        if grey_per_row[rel_y] < min_grey:
+            continue
+
+        # Check if a blue line is within 3 to 10 rows below
+        for dy in range(3, 11):
+            if rel_y + dy >= n_rows:
+                break
+            if blue_per_row[rel_y + dy] >= min_blue:
+                y_text_bottom = abs_y + 2
+                print(f"[ANCHOR] Method C: found label row at "
+                      f"abs_y={abs_y} → y_text_bottom={y_text_bottom}")
+                return y_text_bottom
+
+    print("[ANCHOR] All methods failed to find B Scan text anchor")
+    return None
+
+
+def find_red_line_y(frame_rgb, y_search_start):
+    """
+    Find the red TR baseline below the B-Scan text label.
+    Returns y coordinate of red line.
+    Returns None if not found.
+    """
+    H, W = frame_rgb.shape[:2]
+    x_end = int(W * 0.65)
     
-    line_scores = []
+    R = frame_rgb[y_search_start:H, 0:x_end, 0].astype(int)
+    G = frame_rgb[y_search_start:H, 0:x_end, 1].astype(int)
+    B = frame_rgb[y_search_start:H, 0:x_end, 2].astype(int)
     
-    for y in range(H):
-        row = frame_rgb[y, :, :]
-        
-        r = row[:, 0].astype(float)
-        g = row[:, 1].astype(float)
-        b = row[:, 2].astype(float)
-        
-        avg_r = np.mean(r)
-        avg_g = np.mean(g)
-        avg_b = np.mean(b)
-        
-        if color_type == 'blue':
-            # Blue line: B is much higher than R and G
-            dominance = avg_b - max(avg_r, avg_g)
-        elif color_type == 'red':
-            # Red line: R is much higher than G and B
-            dominance = avg_r - max(avg_g, avg_b)
+    red_mask = (R > 150) & (G < 80) & (B < 80)
+    red_per_row = red_mask.sum(axis=1)
+    
+    min_span = max(int(x_end * 0.08), 20)
+    
+    # Find rows with enough red pixels
+    red_rows = [y_search_start + y
+                for y in range(len(red_per_row))
+                if red_per_row[y] >= min_span]
+    
+    if not red_rows:
+        # Retry with lower threshold
+        min_span_retry = max(int(x_end * 0.03), 10)
+        red_rows = [y_search_start + y
+                    for y in range(len(red_per_row))
+                    if red_per_row[y] >= min_span_retry]
+    
+    if not red_rows:
+        print("[ROI] red line not found")
+        return None
+    
+    # Group consecutive red rows
+    groups = []
+    current = [red_rows[0]]
+    for r in red_rows[1:]:
+        if r - current[-1] <= 10:
+            current.append(r)
         else:
-            dominance = 0
-        
-        if dominance >= min_strength:
-            line_scores.append((y, dominance))
+            groups.append(current)
+            current = [r]
+    groups.append(current)
     
-    # Cluster consecutive high-scoring rows
-    lines = _cluster_lines(line_scores, distance_threshold=4)
-    
-    return lines
+    y_red = int(np.median(groups[0]))
+    print(f"[ROI] red line found at y={y_red}")
+    return y_red
 
 
-def _find_grey_panel_boundaries(frame_rgb, y_top, y_bot):
+def find_blue_lines_between(frame_rgb, y_top, y_bot):
     """
-    Find where the grey B-Scan panel starts and ends horizontally.
-    
-    Grey panel: R≈G≈B, value between 80-220 (not pure white, not pure black)
-    Table area: pure white (R,G,B > 240) or text/cells
-    
-    Scan from left and right to find exact boundaries.
-    
-    Args:
-        frame_rgb: RGB frame
-        y_top: Top of B-Scan zone
-        y_bot: Bottom of B-Scan zone
-    
-    Returns:
-        (x_left, x_right) tuple - boundaries of grey panel
+    Find horizontal blue lines between y_top and y_bot.
+    Returns list of y coordinates of blue lines found.
     """
     H, W = frame_rgb.shape[:2]
+    x_end = int(W * 0.65)
     
-    # Sample multiple rows from the zone for robustness
-    sample_rows = []
-    for i in range(5):
-        y = y_top + int((y_bot - y_top) * i / 5)
-        if y < y_bot:
-            sample_rows.append(y)
-    
-    if not sample_rows:
-        sample_rows = [(y_top + y_bot) // 2]
-    
-    # ========================================================================
-    # Find LEFT boundary: scan left-to-right for first grey pixel
-    # ========================================================================
-    x_left = 0
-    for x in range(W):
-        grey_count = 0
-        
-        for y in sample_rows:
-            r, g, b = int(frame_rgb[y, x, 0]), int(frame_rgb[y, x, 1]), int(frame_rgb[y, x, 2])
-            
-            # Check if this is grey (B-Scan panel color)
-            is_grey = (
-                (abs(int(r) - int(g)) < 20) and
-                (abs(int(g) - int(b)) < 20) and
-                (abs(int(r) - int(b)) < 20) and
-                (80 <= r <= 220)
-            )
-            
-            if is_grey:
-                grey_count += 1
-        
-        # If MOST rows show grey here, we found the left edge
-        if grey_count >= len(sample_rows) * 0.6:
-            x_left = x
-            print(f"[ROI] Left boundary: x={x_left} (grey in {grey_count}/{len(sample_rows)} rows)")
-            break
-    
-    # ========================================================================
-    # Find RIGHT boundary: scan right-to-left for last grey pixel
-    # ========================================================================
-    x_right = W
-    for x in range(W - 1, 0, -1):
-        grey_count = 0
-        
-        for y in sample_rows:
-            r, g, b = int(frame_rgb[y, x, 0]), int(frame_rgb[y, x, 1]), int(frame_rgb[y, x, 2])
-            
-            # Check if grey
-            is_grey = (
-                (abs(int(r) - int(g)) < 20) and
-                (abs(int(g) - int(b)) < 20) and
-                (abs(int(r) - int(b)) < 20) and
-                (80 <= r <= 220)
-            )
-            
-            if is_grey:
-                grey_count += 1
-        
-        # If MOST rows show grey here, we found the right edge
-        if grey_count >= len(sample_rows) * 0.6:
-            x_right = x + 1
-            print(f"[ROI] Right boundary: x={x_right} (grey in {grey_count}/{len(sample_rows)} rows)")
-            break
-    
-    # Sanity check
-    if x_right <= x_left:
-        print(f"[ROI] ERROR: Invalid boundaries x_left={x_left} x_right={x_right}")
-        # Use broad fallback
-        x_left = int(W * 0.05)
-        x_right = int(W * 0.35)
-    
-    # Hard limit: never exceed 40% of frame (B-Scan should be small)
-    x_right = min(x_right, int(W * 0.40))
-    
-    return x_left, x_right
-
-
-
-def _cluster_lines(line_scores, distance_threshold=4):
-    """
-    Cluster consecutive scored lines that are close together.
-    
-    Args:
-        line_scores: list of (y, score) tuples
-        distance_threshold: rows within this distance = same line
-    
-    Returns:
-        list of clustered y-coordinates
-    """
-    if not line_scores:
+    if y_bot <= y_top:
         return []
     
-    line_scores = sorted(line_scores, key=lambda x: x[0])
+    search = frame_rgb[y_top:y_bot, 0:x_end]
+    R = search[:, :, 0].astype(int)
+    G = search[:, :, 1].astype(int)
+    B = search[:, :, 2].astype(int)
     
-    clusters = []
-    current_cluster = [line_scores[0][0]]
+    blue_mask = (R < 100) & (G < 100) & (B > 130)
+    blue_per_row = blue_mask.sum(axis=1)
+    min_span = max(int(x_end * 0.06), 15)
     
-    for i in range(1, len(line_scores)):
-        y, score = line_scores[i]
-        
-        if y - current_cluster[-1] <= distance_threshold:
-            current_cluster.append(y)
+    blue_rows = [y_top + y
+                 for y in range(search.shape[0])
+                 if blue_per_row[y] >= min_span]
+    
+    if not blue_rows:
+        return []
+    
+    # Group consecutive blue rows
+    groups = []
+    current = [blue_rows[0]]
+    for r in blue_rows[1:]:
+        if r - current[-1] <= 10:
+            current.append(r)
         else:
-            clusters.append(int(np.mean(current_cluster)))
-            current_cluster = [y]
+            groups.append(current)
+            current = [r]
+    groups.append(current)
     
-    if current_cluster:
-        clusters.append(int(np.mean(current_cluster)))
-    
-    return sorted(set(clusters))
+    return [int(np.median(g)) for g in groups]
 
 
-def _find_horizontal_lines(frame_rgb, color_type='blue', min_strength=40):
+def find_panel_x_extent(frame, y_first_blue, y_second_blue, y_red):
     """
-    Find SOLID horizontal lines of specific color.
-    
-    Looks for rows where the entire row (or majority) has strong color dominance.
-    This finds ACTUAL lines, not scattered pixels.
-    
-    Args:
-        frame_rgb: RGB frame
-        color_type: 'blue' or 'red'
-        min_strength: minimum color dominance to count as a line
-    
-    Returns:
-        list of y-coordinates of detected lines
-    """
-    H, W = frame_rgb.shape[:2]
-    
-    line_scores = []
-    
-    for y in range(H):
-        row = frame_rgb[y, :, :]
-        
-        r = row[:, 0].astype(float)
-        g = row[:, 1].astype(float)
-        b = row[:, 2].astype(float)
-        
-        avg_r = np.mean(r)
-        avg_g = np.mean(g)
-        avg_b = np.mean(b)
-        
-        if color_type == 'blue':
-            # Blue line: B is much higher than R and G
-            dominance = avg_b - max(avg_r, avg_g)
-        elif color_type == 'red':
-            # Red line: R is much higher than G and B
-            dominance = avg_r - max(avg_g, avg_b)
-        else:
-            dominance = 0
-        
-        if dominance >= min_strength:
-            line_scores.append((y, dominance))
-    
-    # Cluster consecutive high-scoring rows
-    lines = _cluster_lines(line_scores, distance_threshold=4)
-    
-    return lines
+    Find x_left and x_right of the B-Scan content area by
+    measuring the horizontal extent of the blue and red lines.
 
+    The blue lines and red line span exactly the full width
+    of the B-Scan content area from left edge to right edge.
+    This works for any zoom level or resolution.
 
-def _get_fallback_roi(frame):
-    """
-    Return a fallback ROI when line detection fails.
-    Uses a broad central region as a safe default.
-    
     Args:
         frame: BGR frame
-    
-    Returns:
-        ROI dict with fallback coordinates
-    """
-    H, W = frame.shape[:2]
-    
-    print("[ROI] auto=FALLBACK - using broad central region")
-    
-    x_left = int(W * 0.05)   # 5% from left
-    x_right = int(W * 0.50)  # 50% of width (safe limit)
-    y_top = int(H * 0.20)    # 20% from top
-    y_bot = int(H * 0.80)    # 80% from top (60% height)
-    
-    roi = frame[y_top:y_bot, x_left:x_right]
-    
-    print(f"[ROI] Fallback: y_top={y_top} y_bot={y_bot} x_left={x_left} x_right={x_right}")
-    
-    return {
-        "roi": roi,
-        "y_top": y_top,
-        "y_bot": y_bot,
-        "x_left": x_left,
-        "x_right": x_right,
-        "found": False,
-    }
+        y_first_blue: y-coordinate of first blue line
+        y_second_blue: y-coordinate of second blue line
+        y_red: y-coordinate of red line
 
-
-def _get_adaptive_fallback_roi(frame):
-    """
-    Adaptive fallback: tries to find ANY content in the frame
-    and use a region around it.
-    
-    Args:
-        frame: BGR frame
-    
     Returns:
-        ROI dict with adaptive fallback coordinates
+        (x_left, x_right) tuple
     """
     H, W = frame.shape[:2]
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    print("[ROI] auto=ADAPTIVE_FALLBACK - searching for content...")
-    
-    # Look for non-white/non-black regions (likely B-Scan area)
-    r = frame_rgb[:, :, 0].astype(int)
-    g = frame_rgb[:, :, 1].astype(int)
-    b = frame_rgb[:, :, 2].astype(int)
-    
-    # Find pixels that are "content" (not pure white, not pure black)
-    is_content = (
-        ~((r > 240) & (g > 240) & (b > 240)) &  # Not white
-        ~((r < 15) & (g < 15) & (b < 15))       # Not black
-    )
-    
-    content_rows = np.where(is_content.any(axis=1))[0]
-    content_cols = np.where(is_content.any(axis=0))[0]
-    
-    if len(content_rows) > 0 and len(content_cols) > 0:
-        y_top = max(0, content_rows[0])
-        y_bot = min(H, content_rows[-1])
-        x_left = max(0, content_cols[0])
-        x_right = min(int(W * 0.50), content_cols[-1])
-        
-        print(f"[ROI] Adaptive: found content y=[{y_top}, {y_bot}] x=[{x_left}, {x_right}]")
-    else:
-        # Fallback to broad region
-        x_left = int(W * 0.05)
-        x_right = int(W * 0.50)
-        y_top = int(H * 0.20)
-        y_bot = int(H * 0.80)
-        print("[ROI] Adaptive fallback to broad region")
-    
-    roi = frame[y_top:y_bot, x_left:x_right]
-    
+
+    def get_line_x_extent(frame_rgb, y_row, color):
+        """
+        For a given row y_row, find leftmost and rightmost x
+        where that colour appears.
+        color = 'blue' or 'red'
+        """
+        if not (0 <= y_row < frame_rgb.shape[0]):
+            return None, None
+
+        row = frame_rgb[y_row, :, :]
+        R = row[:, 0].astype(int)
+        G = row[:, 1].astype(int)
+        B = row[:, 2].astype(int)
+
+        if color == 'blue':
+            mask = (R < 100) & (G < 100) & (B > 130)
+        else:  # red
+            mask = (R > 150) & (G < 80) & (B < 80)
+
+        xs = np.where(mask)[0]
+        if len(xs) < 10:
+            return None, None
+        return int(xs.min()), int(xs.max())
+
+    # Sample multiple rows near each line to get stable readings
+    # Use ±3 rows around each detected line y-coordinate
+    all_x_lefts = []
+    all_x_rights = []
+
+    for y_line, color in [
+        (y_first_blue, 'blue'),
+        (y_second_blue, 'blue'),
+        (y_red, 'red')
+    ]:
+        for dy in [-3, -2, -1, 0, 1, 2, 3]:
+            y_sample = y_line + dy
+            if 0 <= y_sample < H:
+                xl, xr = get_line_x_extent(frame_rgb, y_sample, color)
+                if xl is not None and xr is not None:
+                    # Only accept if the line spans at least 5% of frame width
+                    if (xr - xl) > int(W * 0.05):
+                        all_x_lefts.append(xl)
+                        all_x_rights.append(xr)
+
+    if not all_x_lefts:
+        print("[ROI] x_extent: could not measure line extents")
+        # Cannot determine — return full left portion as fallback
+        return 0, int(W * 0.60)
+
+    # Take median to ignore outliers
+    x_left = int(np.median(all_x_lefts))
+    x_right = int(np.median(all_x_rights))
+
+    # Add small buffer on each side
+    x_left = max(x_left - 2, 0)
+    x_right = min(x_right + 2, W - 1)
+
+    print(f"[ROI] x_left={x_left} x_right={x_right} "
+          f"panel_width={x_right - x_left}px "
+          f"({(x_right - x_left) / W * 100:.1f}% of frame width)")
+
+    return x_left, x_right
+
+
+def _return_empty_roi():
+    """Return a minimal invalid ROI."""
+    empty = np.zeros((1, 1, 3), dtype=np.uint8)
     return {
-        "roi": roi,
-        "y_top": y_top,
-        "y_bot": y_bot,
-        "x_left": x_left,
-        "x_right": x_right,
+        "roi": empty,
+        "y_top": 0,
+        "y_bot": 1,
+        "x_left": 0,
+        "x_right": 1,
         "found": False,
     }
 
 
 def draw_roi_overlay(frame, roi_dict):
     """
-    Draw bright GREEN rectangle around detection zone on full frame.
+    Draw green rectangle around ROI on full frame.
     
     Args:
-        frame: Full BGR frame
-        roi_dict: Dict from find_bscan_roi()
+        frame: BGR frame
+        roi_dict: dict from find_bscan_roi()
     
     Returns:
-        Annotated frame copy
+        Annotated frame
     """
+    if not roi_dict["found"]:
+        return frame.copy()
+    
     ann_frame = frame.copy()
     
     x_left = roi_dict["x_left"]
@@ -461,12 +528,10 @@ def draw_roi_overlay(frame, roi_dict):
     y_top = roi_dict["y_top"]
     y_bot = roi_dict["y_bot"]
     
-    # Draw green rectangle
     cv2.rectangle(ann_frame, (x_left, y_top), (x_right, y_bot),
                   (0, 255, 0), 3)
     
-    # Draw label "DETECTION ZONE"
-    label = "DETECTION ZONE"
+    label = "B-SCAN ROI"
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.6
     thickness = 2
@@ -475,12 +540,10 @@ def draw_roi_overlay(frame, roi_dict):
     text_x = x_left
     text_y = y_top - 5
     
-    # Black background for text
     cv2.rectangle(ann_frame, (text_x - 2, text_y - th - 2),
                   (text_x + tw + 2, text_y + 2),
                   (0, 0, 0), -1)
     
-    # Green text
     cv2.putText(ann_frame, label, (text_x, text_y),
                 font, scale, (0, 255, 0), thickness, cv2.LINE_AA)
     

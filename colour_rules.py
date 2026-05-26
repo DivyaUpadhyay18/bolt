@@ -20,13 +20,17 @@ def get_purple_mask(roi_rgb):
     g = roi_rgb[:, :, 1].astype(int)
     b = roi_rgb[:, :, 2].astype(int)
     
+    # Exclude blue line pixels first
+    blue_line = (r < 100) & (g < 100) & (b > 130)
+    
     purple_mask = (
         (r >= 85) & (r <= 215) &
         (g >= 25) & (g <= 140) &
         (b >= 85) & (b <= 215) &
         (np.abs(r - b) < 90) &
         ((r - g) > 12) &
-        ((b - g) > 12)
+        ((b - g) > 12) &
+        ~blue_line
     )
     
     return purple_mask
@@ -46,12 +50,16 @@ def get_red_mask(roi_rgb):
     g = roi_rgb[:, :, 1].astype(int)
     b = roi_rgb[:, :, 2].astype(int)
     
+    # Exclude blue line pixels
+    blue_line = (r < 100) & (g < 100) & (b > 130)
+    
     red_mask = (
         (r >= 140) & (r <= 255) &
         (g >= 0) & (g <= 90) &
         (b >= 0) & (b <= 90) &
         ((r - g) > 80) &
-        ((r - b) > 80)
+        ((r - b) > 80) &
+        ~blue_line
     )
     
     return red_mask
@@ -71,11 +79,15 @@ def get_grey_mask(roi_rgb):
     g = roi_rgb[:, :, 1].astype(int)
     b = roi_rgb[:, :, 2].astype(int)
     
+    # Exclude blue line pixels
+    blue_line = (r < 100) & (g < 100) & (b > 130)
+    
     grey_mask = (
         (np.abs(r - g) < 28) &
         (np.abs(g - b) < 28) &
         (np.abs(r - b) < 28) &
-        (r >= 45) & (r <= 195)
+        (r >= 45) & (r <= 195) &
+        ~blue_line
     )
     
     return grey_mask
